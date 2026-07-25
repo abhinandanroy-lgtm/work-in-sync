@@ -1,0 +1,8 @@
+{
+  "pick_account_heading": "text=Pick an account",
+  "pwc_account": "text=abhinandan.roy@pwc.com",
+  "view_team_calendar": "text=View Team Calendar",
+  "search_input": "input[placeholder='Search by name, ID or email']",
+  "clear_all": "text=Clear All",
+  "logged_in_marker": "text=Hi Abhinandan Roy!"
+}
