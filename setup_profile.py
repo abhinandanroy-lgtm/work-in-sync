@@ -1,9 +1,12 @@
 import os
 import subprocess
 import time
+from datetime import datetime
 import requests
 import pandas as pd
 from openpyxl import Workbook, load_workbook
+from openpyxl.styles import PatternFill, Font
+
 from playwright.sync_api import sync_playwright
 
 WIS_URL = "https://pwc.moveinsync.com/WP/employee.jsp#WorkInSyncDashboard"
@@ -14,6 +17,7 @@ SEARCH_WAIT_SEC = 2
 
 INPUT_FILE = "employee_input.xlsx"
 OUTPUT_FILE = "attendance_output.xlsx"
+TRACKER_FILE = "Tracker.xlsx"
 
 ABHINANDAN_ID = "101675341"
 ABHINANDAN_NAME = "Abhinandan Roy"
@@ -33,6 +37,10 @@ CLEAR_ALL_XPATH = "xpath=//*[text()='Clear All']"
 
 ABHINANDAN_STATUS_XPATH = "xpath=(//div[@class='t-row ng-star-inserted'])[1]//div[contains(@class,'desktop_checkedin')]"
 OTHERS_STATUS_XPATH = "xpath=(//div[@class='t-row ng-star-inserted'])[2]//div[contains(@class,'desktop_checkedin')]"
+
+GREEN_FILL = PatternFill(fill_type="solid", start_color="92D050", end_color="92D050")
+HEADER_FILL = PatternFill(fill_type="solid", start_color="BFBFBF", end_color="BFBFBF")
+HEADER_FONT = Font(bold=True, size=12)
 
 
 def ts():
@@ -84,6 +92,165 @@ def write_results_to_excel(results, output_file):
     wb.save(output_file)
     wb.close()
     return sheet_name
+
+
+def get_tracker_sheet_name(dt):
+    return f"Tracker {dt.strftime('%B')}"
+
+
+def apply_tracker_header_style(ws):
+    for col_idx in range(1, ws.max_column + 1):
+        cell = ws.cell(row=1, column=col_idx)
+        cell.font = HEADER_FONT
+        cell.fill = HEADER_FILL
+
+
+def ensure_tracker_headers(ws, day_col_name):
+    headers = [ws.cell(row=1, column=i).value for i in range(1, ws.max_column + 1)]
+
+    if ws.max_row == 1 and all(h is None for h in headers):
+        ws.cell(row=1, column=1).value = "id"
+        ws.cell(row=1, column=2).value = "name"
+        ws.cell(row=1, column=3).value = day_col_name
+        ws.cell(row=1, column=4).value = "Total"
+        apply_tracker_header_style(ws)
+        return
+
+    headers = [ws.cell(row=1, column=i).value for i in range(1, ws.max_column + 1)]
+    headers = [str(h).strip() if h is not None else "" for h in headers]
+
+    if "id" not in headers:
+        ws.insert_cols(1)
+        ws.cell(row=1, column=1).value = "id"
+        headers = [str(ws.cell(row=1, column=i).value).strip() if ws.cell(row=1, column=i).value is not None else "" for i in range(1, ws.max_column + 1)]
+
+    if "name" not in headers:
+        if len(headers) < 2:
+            ws.insert_cols(2)
+        ws.cell(row=1, column=2).value = "name"
+        headers = [str(ws.cell(row=1, column=i).value).strip() if ws.cell(row=1, column=i).value is not None else "" for i in range(1, ws.max_column + 1)]
+
+    headers = [str(ws.cell(row=1, column=i).value).strip() if ws.cell(row=1, column=i).value is not None else "" for i in range(1, ws.max_column + 1)]
+
+    if day_col_name not in headers:
+        total_col = None
+        for i, h in enumerate(headers, start=1):
+            if h == "Total":
+                total_col = i
+                break
+
+        if total_col is not None:
+            ws.insert_cols(total_col)
+            ws.cell(row=1, column=total_col).value = day_col_name
+        else:
+            ws.cell(row=1, column=ws.max_column + 1).value = day_col_name
+
+    headers = [str(ws.cell(row=1, column=i).value).strip() if ws.cell(row=1, column=i).value is not None else "" for i in range(1, ws.max_column + 1)]
+
+    if "Total" not in headers:
+        ws.cell(row=1, column=ws.max_column + 1).value = "Total"
+
+    apply_tracker_header_style(ws)
+
+
+def get_header_map(ws):
+    return {
+        str(ws.cell(row=1, column=i).value).strip(): i
+        for i in range(1, ws.max_column + 1)
+        if ws.cell(row=1, column=i).value is not None
+    }
+
+
+def find_or_create_tracker_row(ws, emp_id, emp_name, header_map):
+    id_col = header_map["id"]
+    name_col = header_map["name"]
+
+    for row_idx in range(2, ws.max_row + 1):
+        existing_id = ws.cell(row=row_idx, column=id_col).value
+        if str(existing_id).strip() == str(emp_id).strip():
+            if not ws.cell(row=row_idx, column=name_col).value:
+                ws.cell(row=row_idx, column=name_col).value = emp_name
+            return row_idx
+
+    row_idx = ws.max_row + 1
+    ws.cell(row=row_idx, column=id_col).value = emp_id
+    ws.cell(row=row_idx, column=name_col).value = emp_name
+    return row_idx
+
+
+def refresh_total_column(ws):
+    header_map = get_header_map(ws)
+    if "Total" not in header_map:
+        return
+
+    total_col = header_map["Total"]
+
+    day_cols = []
+    for header, col_idx in header_map.items():
+        if header not in ["id", "name", "Total"]:
+            day_cols.append(col_idx)
+
+    for row_idx in range(2, ws.max_row + 1):
+        total_available = 0
+        for col_idx in day_cols:
+            value = ws.cell(row=row_idx, column=col_idx).value
+            if str(value).strip().lower() == "available":
+                total_available += 1
+        ws.cell(row=row_idx, column=total_col).value = total_available
+
+
+def update_tracker_excel(results, tracker_file):
+    if not results:
+        return
+
+    first_date = str(results[0]["date"]).strip()
+    try:
+        tracker_date = datetime.strptime(first_date, "%Y-%m-%d")
+    except:
+        tracker_date = datetime.today()
+
+    tracker_sheet_name = get_tracker_sheet_name(tracker_date)
+    day_col_name = first_date
+
+    if os.path.exists(tracker_file):
+        wb = load_workbook(tracker_file)
+    else:
+        wb = Workbook()
+
+    if tracker_sheet_name in wb.sheetnames:
+        ws = wb[tracker_sheet_name]
+    else:
+        if len(wb.sheetnames) == 1 and wb.active.max_row == 1 and wb.active.max_column == 1 and wb.active["A1"].value is None:
+            ws = wb.active
+            ws.title = tracker_sheet_name
+        else:
+            ws = wb.create_sheet(title=tracker_sheet_name)
+
+    ensure_tracker_headers(ws, day_col_name)
+    header_map = get_header_map(ws)
+
+    day_col = header_map[day_col_name]
+
+    for item in results:
+        emp_id = item["employee_id"]
+        emp_name = item["employee_name"]
+        attendance_value = item["attendance"]
+
+        tracker_value = "Available" if attendance_value == "Yes" else "NA"
+
+        row_idx = find_or_create_tracker_row(ws, emp_id, emp_name, header_map)
+        cell = ws.cell(row=row_idx, column=day_col)
+        cell.value = tracker_value
+
+        if tracker_value == "Available":
+            cell.fill = GREEN_FILL
+        else:
+            cell.fill = PatternFill(fill_type=None)
+
+    refresh_total_column(ws)
+    apply_tracker_header_style(ws)
+    wb.save(tracker_file)
+    wb.close()
 
 
 def save_step(page, name):
@@ -463,8 +630,10 @@ def main():
                     })
 
             sheet_name = write_results_to_excel(results, OUTPUT_FILE)
+            update_tracker_excel(results, TRACKER_FILE)
             save_step(page, "09_finished")
             print(f"Done. Output saved to {OUTPUT_FILE}, sheet: {sheet_name}")
+            print(f"Tracker updated in {TRACKER_FILE}")
 
         finally:
             try:
