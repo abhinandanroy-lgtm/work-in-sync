@@ -6,8 +6,8 @@ import requests
 import pandas as pd
 from openpyxl import Workbook, load_workbook
 from openpyxl.styles import PatternFill, Font
-
 from playwright.sync_api import sync_playwright
+import win32com.client
 
 WIS_URL = "https://pwc.moveinsync.com/WP/employee.jsp#WorkInSyncDashboard"
 EDGE_EXE = r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe"
@@ -21,6 +21,10 @@ TRACKER_FILE = "Tracker.xlsx"
 
 ABHINANDAN_ID = "101675341"
 ABHINANDAN_NAME = "Abhinandan Roy"
+
+REPORT_RECIPIENT = "abhinandan.roy@pwc.com"
+REPORT_SUBJECT = "office tracker"
+REPORT_BODY = "Below is the attached file"
 
 DEBUG_DIR = "debug_output"
 SCREENSHOT_DIR = os.path.join(DEBUG_DIR, "screenshots")
@@ -251,6 +255,20 @@ def update_tracker_excel(results, tracker_file):
     apply_tracker_header_style(ws)
     wb.save(tracker_file)
     wb.close()
+
+
+def send_email_with_attachment(to_email, subject, body, attachment_path):
+    try:
+        outlook = win32com.client.Dispatch("Outlook.Application")
+        mail = outlook.CreateItem(0)
+        mail.To = to_email
+        mail.Subject = subject
+        mail.Body = body
+        mail.Attachments.Add(os.path.abspath(attachment_path))
+        mail.Send()
+        print(f"Email sent to {to_email} with attachment: {attachment_path}")
+    except Exception as e:
+        print(f"Failed to send email: {e}")
 
 
 def save_step(page, name):
@@ -631,6 +649,14 @@ def main():
 
             sheet_name = write_results_to_excel(results, OUTPUT_FILE)
             update_tracker_excel(results, TRACKER_FILE)
+
+            send_email_with_attachment(
+                REPORT_RECIPIENT,
+                REPORT_SUBJECT,
+                REPORT_BODY,
+                TRACKER_FILE
+            )
+
             save_step(page, "09_finished")
             print(f"Done. Output saved to {OUTPUT_FILE}, sheet: {sheet_name}")
             print(f"Tracker updated in {TRACKER_FILE}")
