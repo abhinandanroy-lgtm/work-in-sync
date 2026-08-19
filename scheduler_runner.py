@@ -10,7 +10,7 @@ BASE_DIR = Path(__file__).resolve().parent
 SCRIPT_PATH = BASE_DIR / "setup_profile.py"
 PYTHON_EXE = sys.executable
 
-RUN_TIME = "14:06"
+RUN_TIME = "15:50"
 
 is_running = False
 lock = threading.Lock()

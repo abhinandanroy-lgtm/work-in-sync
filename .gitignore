@@ -1,2 +1,6 @@
-
+﻿.env
+__pycache__/
+*.pyc
+debug_output/
 edge_debug_profile/
+failed_awareness_mails.csv
