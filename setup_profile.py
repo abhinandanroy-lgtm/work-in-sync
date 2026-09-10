@@ -1,11 +1,10 @@
 import os
 import csv
+import shutil
 import subprocess
 import time
-import base64
 import calendar
 from datetime import datetime
-
 import requests
 import pandas as pd
 from openpyxl import Workbook, load_workbook
@@ -16,6 +15,9 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+# =========================
+# CONSTANTS
+# =========================
 WIS_URL = "https://pwc.moveinsync.com/WP/employee.jsp#WorkInSyncDashboard"
 EDGE_EXE = r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe"
 CDP_PORT = 9222
@@ -32,9 +34,15 @@ ABHINANDAN_ID = "101675341"
 ABHINANDAN_NAME = "Abhinandan Roy"
 ABHINANDAN_EMAIL = "abhinandan.roy@pwc.com"
 DEBORSHI_EMAIL = "deborshi.som@pwc.com"
+SHREYASI_EMAIL = "shreyasi.dutta@pwc.com"
 
 ACS_CONNECTION = os.getenv("ACS_CONNECTION")
-ACS_SENDER_EMAIL = "DoNotReply@e6aa12e1-707d-4e66-845f-2f5e8845675c.azurecomm.net"
+ACS_SENDER_EMAIL = "DoNotReply@fdd1da09-f617-4c54-b81f-143d8de4b93e.azurecomm.net"
+
+ONEDRIVE_FULL_REPORT_URL = os.getenv(
+    "ONEDRIVE_FULL_REPORT_URL",
+    "https://pwcindia-my.sharepoint.com/:u:/r/personal/abhinandan_roy_pwc_com/Documents/work-in-sync/exported_reports/month_end_full_report_latest.html?d=w249b7a4d1d7d4e478c3bec391032ad2e&csf=1&web=1&e=9RyGg9"
+).strip()
 
 if not ACS_CONNECTION:
     raise ValueError("ACS_CONNECTION environment variable is not set. Please add it in .env file.")
@@ -47,11 +55,20 @@ DEBUG_DIR = "debug_output"
 SCREENSHOT_DIR = os.path.join(DEBUG_DIR, "screenshots")
 HTML_DIR = os.path.join(DEBUG_DIR, "html")
 TEXT_DIR = os.path.join(DEBUG_DIR, "text")
+REPORT_EXPORT_DIR = "exported_reports"
+BACKUP_DIR = "excel_backups"
+EDGE_PROFILE_DIR = os.path.join(os.getcwd(), "edge_debug_profile")
 
 os.makedirs(SCREENSHOT_DIR, exist_ok=True)
 os.makedirs(HTML_DIR, exist_ok=True)
 os.makedirs(TEXT_DIR, exist_ok=True)
+os.makedirs(REPORT_EXPORT_DIR, exist_ok=True)
+os.makedirs(BACKUP_DIR, exist_ok=True)
+os.makedirs(EDGE_PROFILE_DIR, exist_ok=True)
 
+# =========================
+# XPATHS / SELECTORS
+# =========================
 VIEW_TEAM_CALENDAR_XPATH = "xpath=//*[@class='mis-btn mis-none mis-btn-md' and text()='View Team Calendar']"
 SEARCH_XPATH = 'xpath=//*[@placeholder="Search by name, ID or email "]'
 CLEAR_ALL_XPATH = "xpath=//*[text()='Clear All']"
@@ -59,11 +76,16 @@ CLEAR_ALL_XPATH = "xpath=//*[text()='Clear All']"
 ABHINANDAN_STATUS_XPATH = "xpath=(//div[@class='t-row ng-star-inserted'])[1]//div[contains(@class,'desktop_checkedin')]"
 OTHERS_STATUS_XPATH = "xpath=(//div[@class='t-row ng-star-inserted'])[2]//div[contains(@class,'desktop_checkedin')]"
 
+# =========================
+# STYLES
+# =========================
 GREEN_FILL = PatternFill(fill_type="solid", start_color="92D050", end_color="92D050")
-HEADER_FILL = PatternFill(fill_type="solid", start_color="BFBFBF", end_color="BFBFBF")
+HEADER_FILL = PatternFill(fill_type="solid", start_color="D9D9D9", end_color="D9D9D9")
 HEADER_FONT = Font(bold=True, size=12)
 
-
+# =========================
+# UTILS
+# =========================
 def ts():
     return time.strftime("%Y%m%d_%H%M%S")
 
@@ -72,20 +94,57 @@ def today_str():
     return datetime.today().strftime("%Y-%m-%d")
 
 
+def normalize_str(value):
+    return str(value or "").strip()
+
+
+def backup_corrupt_file(file_path):
+    if os.path.exists(file_path):
+        new_name = f"{file_path}.{ts()}.corrupt"
+        shutil.move(file_path, new_name)
+        print(f"Backed up corrupt file: {new_name}")
+
+
+def backup_file_before_save(file_path):
+    if os.path.exists(file_path):
+        base = os.path.basename(file_path)
+        backup_path = os.path.join(BACKUP_DIR, f"{base}.{ts()}.bak")
+        shutil.copy2(file_path, backup_path)
+        print(f"Backup created: {backup_path}")
+
+
+def safe_load_workbook(file_path, create_if_invalid=False):
+    if not os.path.exists(file_path):
+        return Workbook() if create_if_invalid else None
+    try:
+        return load_workbook(file_path)
+    except Exception as e:
+        print(f"Invalid workbook detected: {file_path} | {e}")
+        backup_corrupt_file(file_path)
+        return Workbook() if create_if_invalid else None
+
+
+def save_step(page, name):
+    try:
+        page.screenshot(path=os.path.join(SCREENSHOT_DIR, f"{ts()}_{name}.png"), full_page=True, timeout=8000)
+    except Exception:
+        pass
+
+
+# =========================
+# EXCEL OUTPUT
+# =========================
 def sheet_base_name():
     return time.strftime("%d-%m-%y")
 
 
 def make_unique_sheet_name(output_file):
     base = sheet_base_name()
-
     if not os.path.exists(output_file):
         return f"{base}(1)"
-
-    wb = load_workbook(output_file)
+    wb = safe_load_workbook(output_file, create_if_invalid=True)
     existing = wb.sheetnames
     wb.close()
-
     i = 1
     while True:
         candidate = f"{base}({i})"
@@ -95,30 +154,37 @@ def make_unique_sheet_name(output_file):
 
 
 def write_results_to_excel(results, output_file):
+    if not results:
+        return None
+
     df = pd.DataFrame(results)
     sheet_name = make_unique_sheet_name(output_file)
+    wb = safe_load_workbook(output_file, create_if_invalid=True)
 
-    if not os.path.exists(output_file):
-        wb = Workbook()
+    if (
+        len(wb.sheetnames) == 1
+        and wb.active.max_row == 1
+        and wb.active.max_column == 1
+        and wb.active["A1"].value is None
+    ):
         ws = wb.active
         ws.title = sheet_name
-        ws.append(list(df.columns))
-        for row in df.itertuples(index=False, name=None):
-            ws.append(list(row))
-        wb.save(output_file)
-        wb.close()
-        return sheet_name
+    else:
+        ws = wb.create_sheet(title=sheet_name)
 
-    wb = load_workbook(output_file)
-    ws = wb.create_sheet(title=sheet_name)
     ws.append(list(df.columns))
     for row in df.itertuples(index=False, name=None):
         ws.append(list(row))
+
+    backup_file_before_save(output_file)
     wb.save(output_file)
     wb.close()
     return sheet_name
 
 
+# =========================
+# TRACKER FUNCTIONS
+# =========================
 def get_tracker_sheet_name(dt):
     return f"Tracker {dt.strftime('%B')}"
 
@@ -130,78 +196,6 @@ def apply_tracker_header_style(ws):
         cell.fill = HEADER_FILL
 
 
-def ensure_tracker_headers(ws, day_col_name):
-    headers = [ws.cell(row=1, column=i).value for i in range(1, ws.max_column + 1)]
-
-    if ws.max_row == 1 and all(h is None for h in headers):
-        ws.cell(row=1, column=1).value = "id"
-        ws.cell(row=1, column=2).value = "email"
-        ws.cell(row=1, column=3).value = "name"
-        ws.cell(row=1, column=4).value = day_col_name
-        ws.cell(row=1, column=5).value = "Total"
-        apply_tracker_header_style(ws)
-        return
-
-    headers = [
-        str(ws.cell(row=1, column=i).value).strip()
-        if ws.cell(row=1, column=i).value is not None else ""
-        for i in range(1, ws.max_column + 1)
-    ]
-
-    if "id" not in headers:
-        ws.insert_cols(1)
-        ws.cell(row=1, column=1).value = "id"
-
-    headers = [
-        str(ws.cell(row=1, column=i).value).strip()
-        if ws.cell(row=1, column=i).value is not None else ""
-        for i in range(1, ws.max_column + 1)
-    ]
-
-    if "email" not in headers:
-        ws.insert_cols(2)
-        ws.cell(row=1, column=2).value = "email"
-
-    headers = [
-        str(ws.cell(row=1, column=i).value).strip()
-        if ws.cell(row=1, column=i).value is not None else ""
-        for i in range(1, ws.max_column + 1)
-    ]
-
-    if "name" not in headers:
-        ws.insert_cols(3)
-        ws.cell(row=1, column=3).value = "name"
-
-    headers = [
-        str(ws.cell(row=1, column=i).value).strip()
-        if ws.cell(row=1, column=i).value is not None else ""
-        for i in range(1, ws.max_column + 1)
-    ]
-
-    if day_col_name not in headers:
-        total_col = None
-        for i, h in enumerate(headers, start=1):
-            if h == "Total":
-                total_col = i
-                break
-        if total_col is not None:
-            ws.insert_cols(total_col)
-            ws.cell(row=1, column=total_col).value = day_col_name
-        else:
-            ws.cell(row=1, column=ws.max_column + 1).value = day_col_name
-
-    headers = [
-        str(ws.cell(row=1, column=i).value).strip()
-        if ws.cell(row=1, column=i).value is not None else ""
-        for i in range(1, ws.max_column + 1)
-    ]
-
-    if "Total" not in headers:
-        ws.cell(row=1, column=ws.max_column + 1).value = "Total"
-
-    apply_tracker_header_style(ws)
-
-
 def get_header_map(ws):
     return {
         str(ws.cell(row=1, column=i).value).strip(): i
@@ -210,21 +204,98 @@ def get_header_map(ws):
     }
 
 
-def find_or_create_tracker_row(ws, emp_id, emp_name, header_map):
+def ensure_tracker_structure(ws, day_col_name):
+    if ws.max_row == 1 and ws.max_column == 1 and ws["A1"].value is None:
+        ws["A1"] = "id"
+        ws["B1"] = "email"
+        ws["C1"] = "name"
+        ws["D1"] = day_col_name
+        ws["E1"] = "Total"
+        apply_tracker_header_style(ws)
+        return
+
+    headers = [ws.cell(row=1, column=i).value for i in range(1, ws.max_column + 1)]
+    normalized = [str(h).strip() if h is not None else "" for h in headers]
+    required_prefix = ["id", "email", "name"]
+
+    for idx, expected in enumerate(required_prefix, start=1):
+        if idx <= len(normalized) and normalized[idx - 1] == expected:
+            continue
+        if expected not in normalized:
+            ws.insert_cols(idx)
+            ws.cell(row=1, column=idx).value = expected
+            headers = [ws.cell(row=1, column=i).value for i in range(1, ws.max_column + 1)]
+            normalized = [str(h).strip() if h is not None else "" for h in headers]
+
+    header_map = get_header_map(ws)
+
+    if day_col_name not in header_map:
+        if "Total" in header_map:
+            total_col = header_map["Total"]
+            ws.insert_cols(total_col)
+            ws.cell(row=1, column=total_col).value = day_col_name
+        else:
+            ws.cell(row=1, column=ws.max_column + 1).value = day_col_name
+
+    header_map = get_header_map(ws)
+    if "Total" not in header_map:
+        ws.cell(row=1, column=ws.max_column + 1).value = "Total"
+
+    apply_tracker_header_style(ws)
+
+
+def find_employee_row(ws, emp_id="", emp_email="", emp_name=""):
+    header_map = get_header_map(ws)
+    id_col = header_map.get("id")
+    email_col = header_map.get("email")
+    name_col = header_map.get("name")
+
+    emp_id = normalize_str(emp_id)
+    emp_email = normalize_str(emp_email).lower()
+    emp_name = normalize_str(emp_name).lower()
+
+    if id_col and emp_id:
+        for row_idx in range(2, ws.max_row + 1):
+            existing_id = normalize_str(ws.cell(row=row_idx, column=id_col).value)
+            if existing_id == emp_id:
+                return row_idx
+
+    if email_col and emp_email:
+        for row_idx in range(2, ws.max_row + 1):
+            existing_email = normalize_str(ws.cell(row=row_idx, column=email_col).value).lower()
+            if existing_email == emp_email:
+                return row_idx
+
+    if name_col and emp_name:
+        for row_idx in range(2, ws.max_row + 1):
+            existing_name = normalize_str(ws.cell(row=row_idx, column=name_col).value).lower()
+            if existing_name == emp_name:
+                return row_idx
+
+    return None
+
+
+def upsert_employee_row(ws, emp_id="", emp_email="", emp_name=""):
+    header_map = get_header_map(ws)
     id_col = header_map["id"]
+    email_col = header_map["email"]
     name_col = header_map["name"]
 
-    for row_idx in range(2, ws.max_row + 1):
-        existing_id = ws.cell(row=row_idx, column=id_col).value
-        if str(existing_id).strip() == str(emp_id).strip():
-            existing_name = ws.cell(row=row_idx, column=name_col).value
-            if emp_name and not existing_name:
-                ws.cell(row=row_idx, column=name_col).value = emp_name
-            return row_idx
+    row_idx = find_employee_row(ws, emp_id, emp_email, emp_name)
+    if row_idx is None:
+        row_idx = ws.max_row + 1
 
-    row_idx = ws.max_row + 1
-    ws.cell(row=row_idx, column=id_col).value = emp_id
-    ws.cell(row=row_idx, column=name_col).value = emp_name
+    current_id = normalize_str(ws.cell(row=row_idx, column=id_col).value)
+    current_email = normalize_str(ws.cell(row=row_idx, column=email_col).value)
+    current_name = normalize_str(ws.cell(row=row_idx, column=name_col).value)
+
+    if emp_id and not current_id:
+        ws.cell(row=row_idx, column=id_col).value = emp_id
+    if emp_email and not current_email:
+        ws.cell(row=row_idx, column=email_col).value = emp_email
+    if emp_name and not current_name:
+        ws.cell(row=row_idx, column=name_col).value = emp_name
+
     return row_idx
 
 
@@ -234,40 +305,32 @@ def refresh_total_column(ws):
         return
 
     total_col = header_map["Total"]
-    day_cols = [
-        col_idx for header, col_idx in header_map.items()
-        if header not in ["id", "email", "name", "Total"]
-    ]
+    day_cols = [col_idx for header, col_idx in header_map.items() if header not in ["id", "email", "name", "Total"]]
 
     for row_idx in range(2, ws.max_row + 1):
-        total_available = 0
+        total = 0
         for col_idx in day_cols:
-            value = ws.cell(row=row_idx, column=col_idx).value
-            if str(value).strip().lower() == "available":
-                total_available += 1
-        ws.cell(row=row_idx, column=total_col).value = total_available
+            value = normalize_str(ws.cell(row=row_idx, column=col_idx).value).lower()
+            if value == "available":
+                total += 1
+        ws.cell(row=row_idx, column=total_col).value = total
 
 
 def update_tracker_excel(results, tracker_file):
     if not results:
         return
 
-    first_date = str(results[0]["date"]).strip()
+    day_col_name = normalize_str(results[0].get("date", today_str()))
     try:
-        tracker_date = datetime.strptime(first_date, "%Y-%m-%d")
+        tracker_date = datetime.strptime(day_col_name, "%Y-%m-%d")
     except Exception:
         tracker_date = datetime.today()
 
-    tracker_sheet_name = get_tracker_sheet_name(tracker_date)
-    day_col_name = first_date
+    sheet_name = get_tracker_sheet_name(tracker_date)
+    wb = safe_load_workbook(tracker_file, create_if_invalid=True)
 
-    if os.path.exists(tracker_file):
-        wb = load_workbook(tracker_file)
-    else:
-        wb = Workbook()
-
-    if tracker_sheet_name in wb.sheetnames:
-        ws = wb[tracker_sheet_name]
+    if sheet_name in wb.sheetnames:
+        ws = wb[sheet_name]
     else:
         if (
             len(wb.sheetnames) == 1
@@ -276,38 +339,42 @@ def update_tracker_excel(results, tracker_file):
             and wb.active["A1"].value is None
         ):
             ws = wb.active
-            ws.title = tracker_sheet_name
+            ws.title = sheet_name
         else:
-            ws = wb.create_sheet(title=tracker_sheet_name)
+            ws = wb.create_sheet(title=sheet_name)
 
-    ensure_tracker_headers(ws, day_col_name)
+    ensure_tracker_structure(ws, day_col_name)
     header_map = get_header_map(ws)
     day_col = header_map[day_col_name]
 
     for item in results:
-        emp_id = item["employee_id"]
-        emp_name = item["employee_name"]
-        attendance_value = item["attendance"]
-        tracker_value = "Available" if attendance_value == "Yes" else "NA"
+        emp_id = normalize_str(item.get("employee_id", ""))
+        emp_email = normalize_str(item.get("employee_email", ""))
+        emp_name = normalize_str(item.get("employee_name", ""))
+        attendance_value = normalize_str(item.get("attendance", ""))
 
-        row_idx = find_or_create_tracker_row(ws, emp_id, emp_name, header_map)
+        if not emp_id and not emp_email and not emp_name:
+            continue
+
+        row_idx = upsert_employee_row(ws, emp_id, emp_email, emp_name)
+        value = "Available" if attendance_value == "Yes" else "NA"
+
         cell = ws.cell(row=row_idx, column=day_col)
-        cell.value = tracker_value
-
-        if tracker_value == "Available":
-            cell.fill = GREEN_FILL
-        else:
-            cell.fill = PatternFill(fill_type=None)
+        cell.value = value
+        cell.fill = GREEN_FILL if value == "Available" else PatternFill(fill_type=None)
 
     refresh_total_column(ws)
     apply_tracker_header_style(ws)
+    backup_file_before_save(tracker_file)
     wb.save(tracker_file)
     wb.close()
 
 
+# =========================
+# EMAIL FUNCTIONS
+# =========================
 def send_html_email(to_email, subject, html_body, plain_text=None, display_name=None, max_retries=MAIL_RETRY_COUNT):
     attempt = 0
-
     while attempt < max_retries:
         try:
             client = EmailClient.from_connection_string(ACS_CONNECTION)
@@ -326,301 +393,67 @@ def send_html_email(to_email, subject, html_body, plain_text=None, display_name=
                 },
             }
 
-            poller = client.begin_send(message)
-            result = poller.result()
+            result = client.begin_send(message).result()
             print(f"Email sent to {to_email}. Message ID: {result['id']}")
             return True
 
         except Exception as e:
-            err = str(e)
             attempt += 1
-
+            err = str(e)
             if "TooManyRequests" in err:
                 wait_time = min(20 * attempt, 120)
-                print(f"Rate limited while sending to {to_email}. Retry {attempt}/{max_retries} after {wait_time}s...")
+                print(f"Rate limited for {to_email}. Retry {attempt}/{max_retries} after {wait_time}s...")
                 time.sleep(wait_time)
             else:
-                print(f"Failed to send html email to {to_email}: {e}")
+                print(f"Failed to send email to {to_email}: {e}")
                 return False
-
-    print(f"Failed to send html email to {to_email} after {max_retries} retries.")
     return False
 
 
-def send_html_email_multi(to_emails, subject, html_body, plain_text=None, max_retries=MAIL_RETRY_COUNT):
-    attempt = 0
-
-    while attempt < max_retries:
-        try:
-            client = EmailClient.from_connection_string(ACS_CONNECTION)
-
-            recipients = [{"address": mail.strip()} for mail in to_emails if str(mail).strip()]
-
-            message = {
-                "senderAddress": ACS_SENDER_EMAIL,
-                "recipients": {"to": recipients},
-                "content": {
-                    "subject": subject,
-                    "plainText": plain_text or "Monthly attendance report",
-                    "html": html_body,
-                },
-            }
-
-            poller = client.begin_send(message)
-            result = poller.result()
-            print(f"Email sent to {', '.join(to_emails)}. Message ID: {result['id']}")
-            return True
-
-        except Exception as e:
-            err = str(e)
-            attempt += 1
-
-            if "TooManyRequests" in err:
-                wait_time = min(20 * attempt, 120)
-                print(f"Rate limited while sending report. Retry {attempt}/{max_retries} after {wait_time}s...")
-                time.sleep(wait_time)
-            else:
-                print(f"Failed to send report email: {e}")
-                return False
-
-    print("Failed to send report email after retries.")
-    return False
-
-
-def get_today_column_name():
-    return datetime.today().strftime("%Y-%m-%d")
+# =========================
+# REPORT / AWARENESS
+# =========================
+def build_awareness_mail_html(employee_name, employee_id, days_in_office, days_pending):
+    return f"""
+    <html>
+    <body style="font-family: Arial, sans-serif;">
+        <h2 style="color:#F58025;">Office Availability Summary</h2>
+        <p>Hi <b>{employee_name}</b>,</p>
+        <p><b>Employee ID:</b> {employee_id}</p>
+        <p><b>Days in Office:</b> {days_in_office}</p>
+        <p><b>Days Pending:</b> {days_pending}</p>
+    </body>
+    </html>
+    """
 
 
 def get_month_sheet_or_none(workbook_path):
-    if not os.path.exists(workbook_path):
+    wb = safe_load_workbook(workbook_path, create_if_invalid=False)
+    if wb is None:
         return None, None, None
 
-    wb = load_workbook(workbook_path, data_only=True)
     sheet_name = get_tracker_sheet_name(datetime.today())
     if sheet_name not in wb.sheetnames:
         wb.close()
         return None, None, None
 
     ws = wb[sheet_name]
-    header_map = get_header_map(ws)
-    return wb, ws, header_map
+    return wb, ws, get_header_map(ws)
 
 
-def read_employee_input():
-    df = pd.read_excel(INPUT_FILE).fillna("")
-    rename_map = {}
-    for col in df.columns:
-        low = str(col).strip().lower()
-        if low in ["id", "employee id", "employee_id"]:
-            rename_map[col] = "employee_id"
-        elif low in ["name", "employee name", "employee_name"]:
-            rename_map[col] = "employee_name"
-    df = df.rename(columns=rename_map)
-
-    if "employee_id" not in df.columns:
-        df["employee_id"] = ""
-    if "employee_name" not in df.columns:
-        df["employee_name"] = ""
-
-    return df
+def clear_failed_awareness_log():
+    if os.path.exists(FAILED_AWARENESS_CSV):
+        os.remove(FAILED_AWARENESS_CSV)
 
 
-def read_monthly_employees_from_test_tracker():
-    wb, ws, header_map = get_month_sheet_or_none(TEST_TRACKER_FILE)
-    if wb is None:
-        raise Exception("Test_Tracker monthly sheet not found. Please ensure the current month sheet exists.")
-
-    if "id" not in header_map or "name" not in header_map:
-        wb.close()
-        raise Exception("Test_Tracker monthly sheet must contain 'id' and 'name' columns.")
-
+def read_failed_awareness_recipients():
+    if not os.path.exists(FAILED_AWARENESS_CSV):
+        return []
     rows = []
-    for row_idx in range(2, ws.max_row + 1):
-        emp_id = str(ws.cell(row=row_idx, column=header_map["id"]).value or "").strip()
-        emp_name = str(ws.cell(row=row_idx, column=header_map["name"]).value or "").strip()
-
-        if not emp_id and not emp_name:
-            continue
-
-        rows.append({
-            "employee_id": emp_id,
-            "employee_name": emp_name
-        })
-
-    wb.close()
-    return pd.DataFrame(rows)
-
-
-def merge_unique_employees(df1, df2):
-    combined = pd.concat([df1[["employee_id", "employee_name"]], df2[["employee_id", "employee_name"]]], ignore_index=True)
-    combined["employee_id"] = combined["employee_id"].astype(str).str.strip()
-    combined["employee_name"] = combined["employee_name"].astype(str).str.strip()
-    combined = combined[(combined["employee_id"] != "") | (combined["employee_name"] != "")]
-    combined = combined.drop_duplicates(subset=["employee_id"], keep="first")
-    return combined.reset_index(drop=True)
-
-
-def build_awareness_mail_html(employee_name, employee_id, days_in_office, days_pending):
-    html = f"""<!DOCTYPE html>
-<html xmlns="http://www.w3.org/1999/xhtml" xmlns:v="urn:schemas-microsoft-com:vml" xmlns:o="urn:schemas-microsoft-com:office:office">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Employee Office Availability Metrics</title>
-  <!--[if mso]>
-  <style type="text/css">
-    table {{border-collapse: collapse;}}
-    .fallback-font {{font-family: Arial, sans-serif !important;}}
-  </style>
-  <![endif]-->
-</head>
-<body style="margin:0; padding:0; background-color:#f2f2f2;">
-
-  <div style="display:none; max-height:0; overflow:hidden;">
-    Your Office availability summary is ready.
-  </div>
-
-  <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background-color:#f2f2f2;">
-    <tr>
-      <td align="center" style="padding: 40px 15px;">
-
-        <table role="presentation" width="600" cellpadding="0" cellspacing="0" style="width:600px; max-width:600px; background-color:#ffffff; box-shadow:0 2px 10px rgba(0,0,0,0.06);">
-
-          <tr>
-            <td style="padding:0;">
-              <!--[if mso]>
-              <v:rect xmlns:v="urn:schemas-microsoft-com:vml" fill="true" stroke="false" style="width:600px;mso-width-percent:0;">
-              <v:fill type="gradient" color="#ffffff" color2="#F58025" angle="135" />
-              <v:textbox inset="0,0,0,0" style="mso-fit-shape-to-text:false;">
-              <![endif]-->
-              <div style="background: linear-gradient(135deg, #ffffff 0%, #ffe6d1 25%, #ffb066 60%, #F58025 100%);">
-                <table role="presentation" width="100%" cellpadding="0" cellspacing="0">
-                  <tr>
-                    <td style="padding: 36px 40px 0 40px;">
-                      <span style="font-family: Arial, sans-serif; font-size:12px; color:#a8340a; letter-spacing:1.2px; font-weight:bold;">
-                        PwC&nbsp;&nbsp;|&nbsp;&nbsp;Canada IT
-                      </span>
-                    </td>
-                  </tr>
-                  <tr>
-                    <td style="padding: 10px 40px 0 40px;">
-                      <span style="font-family: Arial, sans-serif; font-size:25px; color:#000000; font-weight:bold; line-height:32px;">
-                        Office Availability Summary
-                      </span>
-                    </td>
-                  </tr>
-                  <tr>
-                    <td style="padding: 16px 40px 32px 40px;">
-                      <table role="presentation" cellpadding="0" cellspacing="0">
-                        <tr>
-                          <td style="background-color:#000000; height:4px; width:60px; line-height:4px; font-size:1px;">&nbsp;</td>
-                        </tr>
-                      </table>
-                    </td>
-                  </tr>
-                </table>
-              </div>
-              <!--[if mso]>
-              </v:textbox>
-              </v:rect>
-              <![endif]-->
-            </td>
-          </tr>
-
-          <tr>
-            <td style="padding: 28px 40px 10px 40px;">
-              <p style="margin:0; font-family: Arial, sans-serif; font-size:15px; color:#000000; line-height:22px;">
-                Hi <strong>{employee_name}</strong>,
-              </p>
-
-              <p style="margin:10px 0 12px 0; font-family: Arial, sans-serif; font-size:14px; color:#555555; line-height:21px;">
-                Here's a snapshot of your office availability progress for the current month. If you have any remaining in-office days to meet your monthly availability requirement, we encourage you to plan them at your convenience and stay on track before the month concludes.
-              </p>
-
-              <p style="margin:0 0 12px 0; font-family: Arial, sans-serif; font-size:14px; color:#555555; line-height:21px;">
-                If your current bookings do not reflect your in-office availability, please take a moment to review and book them in WorkInSync from the next time, so your schedule remains up to date.
-              </p>
-
-              <p style="margin:0 0 12px 0; font-family: Arial, sans-serif; font-size:14px; color:#555555; line-height:21px;">
-                If you have already discussed and aligned your availability plan with your People Manager, please feel free to disregard this notification.
-              </p>
-
-              <p style="margin:0; font-family: Arial, sans-serif; font-size:14px; color:#555555; line-height:21px;">
-                Thank you for your continued collaboration and support in fostering a positive workplace experience.
-              </p>
-            </td>
-          </tr>
-
-          <tr>
-            <td style="padding: 20px 40px 10px 40px;">
-              <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="border:1px solid #eeeeee;">
-                <tr>
-                  <td style="padding: 16px 20px; background-color:#fafafa;" width="50%">
-                    <span style="font-family: Arial, sans-serif; font-size:11px; color:#999999; text-transform:uppercase; letter-spacing:0.5px; font-weight:bold;">Employee Name</span>
-                    <br>
-                    <span style="font-family: Arial, sans-serif; font-size:16px; color:#000000; font-weight:bold;">{employee_name}</span>
-                  </td>
-                  <td style="padding: 16px 20px; background-color:#fafafa; border-left:1px solid #eeeeee;" width="50%">
-                    <span style="font-family: Arial, sans-serif; font-size:11px; color:#999999; text-transform:uppercase; letter-spacing:0.5px; font-weight:bold;">Employee ID</span>
-                    <br>
-                    <span style="font-family: Arial, sans-serif; font-size:16px; color:#000000; font-weight:bold;">{employee_id}</span>
-                  </td>
-                </tr>
-              </table>
-            </td>
-          </tr>
-
-          <tr>
-            <td style="padding: 24px 40px 36px 40px;">
-              <table role="presentation" width="100%" cellpadding="0" cellspacing="0">
-                <tr>
-                  <td width="48%" valign="top" style="background: linear-gradient(135deg, #fff0e4 0%, #ffd9b8 100%); border:1px solid #F58025; padding:24px 20px;">
-                    <span style="font-family: Arial, sans-serif; font-size:11px; color:#a8340a; font-weight:bold; text-transform:uppercase; letter-spacing:0.5px;">
-                      Days in Office
-                    </span>
-                    <br>
-                    <span style="font-family: Arial, sans-serif; font-size:40px; color:#F58025; font-weight:bold; line-height:50px;">
-                      {days_in_office}
-                    </span>
-                    <span style="font-family: Arial, sans-serif; font-size:13px; color:#333333;"> / {MONTHLY_TARGET_DAYS} days</span>
-                  </td>
-
-                  <td width="4%">&nbsp;</td>
-
-                  <td width="48%" valign="top" style="background-color:#000000; padding:24px 20px; border:1px solid #000000;">
-                    <span style="font-family: Arial, sans-serif; font-size:11px; color:#ffffff; font-weight:bold; text-transform:uppercase; letter-spacing:0.5px;">
-                      Days Pending
-                    </span>
-                    <br>
-                    <span style="font-family: Arial, sans-serif; font-size:40px; color:#FF8A3D; font-weight:bold; line-height:50px;">
-                      {days_pending}
-                    </span>
-                    <span style="font-family: Arial, sans-serif; font-size:13px; color:#cccccc;"> days left</span>
-                  </td>
-                </tr>
-              </table>
-            </td>
-          </tr>
-
-          <tr>
-            <td style="background-color:#000000; padding: 22px 40px;">
-              <p style="margin:0; font-family: Arial, sans-serif; font-size:11px; color:#ffffff; line-height:16px; text-align:center;">
-                This is an automated message from Canada IT. For questions, contact
-                <a href="mailto:shreyasi.dutta@pwc.com" style="color:#F58025; text-decoration:underline;">shreyasi.dutta@pwc.com</a>.
-                <br>
-                © 2026 PwC. All rights reserved.
-              </p>
-            </td>
-          </tr>
-
-        </table>
-      </td>
-    </tr>
-  </table>
-
-</body>
-</html>"""
-    return html
+    with open(FAILED_AWARENESS_CSV, "r", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        rows.extend(reader)
+    return rows
 
 
 def log_failed_awareness_mail(employee_id, employee_name, employee_email, reason):
@@ -632,23 +465,6 @@ def log_failed_awareness_mail(employee_id, employee_name, employee_email, reason
         writer.writerow([today_str(), employee_id, employee_name, employee_email, reason])
 
 
-def clear_failed_awareness_log():
-    if os.path.exists(FAILED_AWARENESS_CSV):
-        os.remove(FAILED_AWARENESS_CSV)
-
-
-def read_failed_awareness_recipients():
-    if not os.path.exists(FAILED_AWARENESS_CSV):
-        return []
-
-    rows = []
-    with open(FAILED_AWARENESS_CSV, "r", encoding="utf-8") as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            rows.append(row)
-    return rows
-
-
 def rewrite_failed_awareness_log(rows):
     if not rows:
         clear_failed_awareness_log()
@@ -657,37 +473,26 @@ def rewrite_failed_awareness_log(rows):
     with open(FAILED_AWARENESS_CSV, "w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
         writer.writerow(["date", "employee_id", "employee_name", "employee_email", "reason"])
-        for row in rows:
-            writer.writerow(row)
+        writer.writerows(rows)
 
 
-def get_days_in_office_from_test_tracker(employee_id):
+def get_days_in_office_from_test_tracker(employee_id, employee_email="", employee_name=""):
     wb, ws, header_map = get_month_sheet_or_none(TEST_TRACKER_FILE)
     if wb is None:
         return 0
 
-    try:
-        if "id" not in header_map or "Total" not in header_map:
-            wb.close()
-            return 0
-
-        for row_idx in range(2, ws.max_row + 1):
-            existing_id = str(ws.cell(row=row_idx, column=header_map["id"]).value or "").strip()
-            if existing_id == str(employee_id).strip():
-                try:
-                    val = int(ws.cell(row=row_idx, column=header_map["Total"]).value or 0)
-                except Exception:
-                    val = 0
-                wb.close()
-                return val
-    except Exception:
-        pass
-
-    try:
+    row_idx = find_employee_row(ws, employee_id, employee_email, employee_name)
+    if row_idx is None or "Total" not in header_map:
         wb.close()
+        return 0
+
+    try:
+        value = int(ws.cell(row=row_idx, column=header_map["Total"]).value or 0)
     except Exception:
-        pass
-    return 0
+        value = 0
+
+    wb.close()
+    return value
 
 
 def send_awareness_mails_from_test_tracker(test_tracker_file):
@@ -704,42 +509,31 @@ def send_awareness_mails_from_test_tracker(test_tracker_file):
             return
 
     clear_failed_awareness_log()
-
     sent_count = 0
     fail_count = 0
 
     for row_idx in range(2, ws.max_row + 1):
-        employee_id = str(ws.cell(row=row_idx, column=header_map["id"]).value or "").strip()
-        employee_email = str(ws.cell(row=row_idx, column=header_map["email"]).value or "").strip()
-        employee_name = str(ws.cell(row=row_idx, column=header_map["name"]).value or "").strip()
-        total_value = ws.cell(row=row_idx, column=header_map["Total"]).value
-
-        if not employee_id and not employee_name:
-            continue
-        if not employee_email:
-            continue
+        employee_id = normalize_str(ws.cell(row=row_idx, column=header_map["id"]).value)
+        employee_email = normalize_str(ws.cell(row=row_idx, column=header_map["email"]).value)
+        employee_name = normalize_str(ws.cell(row=row_idx, column=header_map["name"]).value)
 
         try:
-            days_in_office = int(total_value)
+            days_in_office = int(ws.cell(row=row_idx, column=header_map["Total"]).value or 0)
         except Exception:
             days_in_office = 0
 
-        days_pending = max(MONTHLY_TARGET_DAYS - days_in_office, 0)
+        if not employee_email:
+            continue
 
-        html_body = build_awareness_mail_html(
-            employee_name=employee_name,
-            employee_id=employee_id,
-            days_in_office=days_in_office,
-            days_pending=days_pending
-        )
+        days_pending = max(MONTHLY_TARGET_DAYS - days_in_office, 0)
+        html_body = build_awareness_mail_html(employee_name, employee_id, days_in_office, days_pending)
 
         ok = send_html_email(
-            to_email=employee_email,
-            subject="Office Availability Summary",
-            html_body=html_body,
-            plain_text=f"Hi {employee_name}, your office availability summary is ready. Days in office: {days_in_office}. Days pending: {days_pending}.",
-            display_name=employee_name,
-            max_retries=MAIL_RETRY_COUNT
+            employee_email,
+            "Office Availability Summary",
+            html_body,
+            plain_text=f"Hi {employee_name}, Days in office: {days_in_office}. Days pending: {days_pending}.",
+            display_name=employee_name
         )
 
         if ok:
@@ -753,9 +547,6 @@ def send_awareness_mails_from_test_tracker(test_tracker_file):
     wb.close()
     print(f"Awareness mail run completed. Sent: {sent_count}, Failed: {fail_count}")
 
-    if fail_count > 0:
-        print(f"Failed recipient log saved to: {FAILED_AWARENESS_CSV}")
-
 
 def resend_failed_awareness_mails():
     failed_rows = read_failed_awareness_recipients()
@@ -763,37 +554,24 @@ def resend_failed_awareness_mails():
         print("No failed awareness mail log found or no failed recipients.")
         return
 
-    print(f"Retrying failed awareness mails: {len(failed_rows)} recipients")
-
     still_failed = []
     success_count = 0
 
     for row in failed_rows:
-        employee_id = str(row.get("employee_id", "")).strip()
-        employee_name = str(row.get("employee_name", "")).strip()
-        employee_email = str(row.get("employee_email", "")).strip()
+        employee_id = normalize_str(row.get("employee_id"))
+        employee_name = normalize_str(row.get("employee_name"))
+        employee_email = normalize_str(row.get("employee_email"))
 
-        if not employee_email:
-            still_failed.append([today_str(), employee_id, employee_name, employee_email, "Missing email"])
-            continue
-
-        days_in_office = get_days_in_office_from_test_tracker(employee_id)
+        days_in_office = get_days_in_office_from_test_tracker(employee_id, employee_email, employee_name)
         days_pending = max(MONTHLY_TARGET_DAYS - days_in_office, 0)
-
-        html_body = build_awareness_mail_html(
-            employee_name=employee_name,
-            employee_id=employee_id,
-            days_in_office=days_in_office,
-            days_pending=days_pending
-        )
+        html_body = build_awareness_mail_html(employee_name, employee_id, days_in_office, days_pending)
 
         ok = send_html_email(
-            to_email=employee_email,
-            subject="Office Availability Summary",
-            html_body=html_body,
-            plain_text=f"Hi {employee_name}, your office availability summary is ready. Days in office: {days_in_office}. Days pending: {days_pending}.",
-            display_name=employee_name,
-            max_retries=MAIL_RETRY_COUNT
+            employee_email,
+            "Office Availability Summary",
+            html_body,
+            plain_text=f"Hi {employee_name}, Days in office: {days_in_office}. Days pending: {days_pending}.",
+            display_name=employee_name
         )
 
         if ok:
@@ -804,13 +582,6 @@ def resend_failed_awareness_mails():
         time.sleep(MAIL_THROTTLE_DELAY_SEC)
 
     rewrite_failed_awareness_log(still_failed)
-
-    if still_failed:
-        print(f"Some recipients still failed. Updated log: {FAILED_AWARENESS_CSV}")
-    else:
-        clear_failed_awareness_log()
-        print("All previously failed awareness mails sent successfully.")
-
     print(f"Resend summary. Success: {success_count}, Remaining failed: {len(still_failed)}")
 
 
@@ -829,362 +600,474 @@ def read_tracker_summary(tracker_file):
     if wb is None:
         return None, "Tracker monthly sheet not found."
 
-    required = ["id", "name", "Total"]
-    for col in required:
-        if col not in header_map:
-            wb.close()
-            return None, f"Required column missing: {col}"
+    if "id" not in header_map or "name" not in header_map or "Total" not in header_map:
+        wb.close()
+        return None, "Required columns missing."
 
     rows = []
     total_emp = 0
     total_attendance_sum = 0
+    below_10 = 0
+    equal_10 = 0
+    above_10 = 0
+
+    email_col = header_map.get("email")
 
     for row_idx in range(2, ws.max_row + 1):
-        emp_id = str(ws.cell(row=row_idx, column=header_map["id"]).value or "").strip()
-        emp_name = str(ws.cell(row=row_idx, column=header_map["name"]).value or "").strip()
-        total_val = ws.cell(row=row_idx, column=header_map["Total"]).value
-
-        if not emp_id and not emp_name:
-            continue
+        emp_id = normalize_str(ws.cell(row=row_idx, column=header_map["id"]).value)
+        emp_name = normalize_str(ws.cell(row=row_idx, column=header_map["name"]).value)
+        emp_email = normalize_str(ws.cell(row=row_idx, column=email_col).value) if email_col else ""
 
         try:
-            total_attendance = int(total_val)
+            total = int(ws.cell(row=row_idx, column=header_map["Total"]).value or 0)
         except Exception:
-            total_attendance = 0
+            total = 0
+
+        if not emp_id and not emp_name and not emp_email:
+            continue
 
         total_emp += 1
-        total_attendance_sum += total_attendance
+        total_attendance_sum += total
+
+        if total < 10:
+            below_10 += 1
+        elif total == 10:
+            equal_10 += 1
+        else:
+            above_10 += 1
 
         rows.append({
             "id": emp_id,
             "name": emp_name,
-            "total": total_attendance
+            "email": emp_email,
+            "total": total
         })
 
     wb.close()
 
-    avg_attendance = round(total_attendance_sum / total_emp, 2) if total_emp else 0
     today = datetime.today()
+    avg_attendance = round(total_attendance_sum / total_emp, 2) if total_emp else 0
     working_days = get_working_days_in_month(today.year, today.month)
 
-    summary = {
+    return {
         "total_emp": total_emp,
         "avg_attendance": avg_attendance,
         "working_days": working_days,
+        "below_10": below_10,
+        "equal_10": equal_10,
+        "above_10": above_10,
         "rows": rows,
-        "month": today.strftime("%B"),
-        "year": today.strftime("%Y"),
+        "month_year_text": today.strftime("%B / %Y"),
         "report_date": today.strftime("%Y-%m-%d")
-    }
-    return summary, None
+    }, None
 
 
-def build_month_end_report_html(tracker_file):
+def build_month_end_report_html(tracker_file, full_report_url="#", salutation="Team"):
     summary, error = read_tracker_summary(tracker_file)
     if error:
         return f"<html><body><p>{error}</p></body></html>"
 
-    table_rows = ""
-    sorted_rows = sorted(summary["rows"], key=lambda x: x["total"], reverse=True)
-
-    for item in sorted_rows:
-        total = item["total"]
-
-        if total < 10:
-            bg_color = "#FFE8D9"
-            text_color = "#C0562A"
-        elif total == 10:
-            bg_color = "#E3F7EA"
-            text_color = "#2E9E5B"
-        else:
-            bg_color = "#1A7A4A"
-            text_color = "#FFFFFF"
-
-        table_rows += f"""
-                    <tr class="data-row" style="border-bottom:1px solid #f0f0f0;">
-                        <td style="padding:11px 15px; font-size:13px; color:#333333; font-family:Arial,sans-serif;">{item['name']}</td>
-                        <td style="padding:11px 15px; font-size:13px; color:#333333; font-family:Arial,sans-serif;">{item['id']}</td>
-                        <td align="center" style="padding:11px 15px; font-size:13px; font-family:Arial,sans-serif;">
-                            <span style="display:inline-block; min-width:42px; padding:5px 10px; border-radius:14px; background-color:{bg_color}; color:{text_color}; font-weight:700;">
-                                {total}
-                            </span>
-                        </td>
-                    </tr>
+    button_html = ""
+    if full_report_url:
+        button_html = f"""
+        <div style="text-align:center; margin-top:20px;">
+            <a href="{full_report_url}"
+               style="display:inline-block; background:#f58645; color:#ffffff; text-decoration:none; padding:14px 28px; border-radius:8px; font-size:18px; font-weight:500;">
+                View Full Report
+            </a>
+        </div>
         """
 
-    html = f"""<!DOCTYPE html>
-<html xmlns="http://www.w3.org/1999/xhtml" xmlns:v="urn:schemas-microsoft-com:vml" xmlns:o="urn:schemas-microsoft-com:office:office">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Monthly Attendance Report</title>
-<!--[if mso]>
-<noscript><xml><o:OfficeDocumentSettings><o:PixelsPerInch>96</o:PixelsPerInch></o:OfficeDocumentSettings></xml></noscript>
-<![endif]-->
-<style type="text/css">
-    body, table, td, p {{ -webkit-text-size-adjust: 100%; -ms-text-size-adjust: 100%; }}
-    table, td {{ mso-table-lspace: 0pt; mso-table-rspace: 0pt; }}
-    body {{ margin:0 !important; padding:0 !important; width:100% !important; font-family: Arial, Helvetica, sans-serif; }}
-    @media only screen and (max-width: 600px) {{
-        .email-container {{ width: 100% !important; }}
-        .mobile-padding {{ padding-left: 15px !important; padding-right: 15px !important; }}
-        .responsive-table td, .responsive-table th {{ font-size: 12px !important; padding: 6px 4px !important; }}
-        .header-text {{ font-size: 20px !important; }}
-        .intro-text {{ font-size: 14px !important; }}
-        .header-pad {{ padding: 26px 20px 24px 20px !important; }}
-    }}
-    .data-row:hover {{ background-color: #FFF8F3 !important; }}
-</style>
-</head>
-<body style="margin:0; padding:0; background-color:#f4f4f4;">
+    return f"""
+    <html>
+    <body style="margin:0; padding:0; background:#f3f3f3; font-family:Arial, sans-serif; color:#444;">
+        <div style="max-width:800px; margin:20px auto; background:#ffffff; box-shadow:0 2px 10px rgba(0,0,0,0.08);">
+            <div style="background:#f58645; padding:36px 40px 30px 40px;">
+                <div style="font-size:14px; color:#7a4a2b; letter-spacing:2px; font-weight:bold;">
+                    PwC &nbsp;|&nbsp; Canada IT
+                </div>
 
-<div style="display:none; max-height:0; overflow:hidden; mso-hide:all;">
-    Monthly attendance summary report for {summary['total_emp']} employees - Review office attendance data
-</div>
+                <h1 style="margin:22px 0 10px 0; font-size:28px; color:#222; font-weight:700;">
+                    Monthly Employee Office Availability Report
+                </h1>
 
-<table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="background-color:#f4f4f4;">
-<tr><td align="center" style="padding:20px 10px;">
+                <div style="width:72px; height:3px; background:#5b2d1f; margin:8px 0 16px 0;"></div>
 
-<table role="presentation" class="email-container" width="800" cellpadding="0" cellspacing="0" border="0" style="max-width:800px; width:100%; background-color:#ffffff; border-radius:8px; overflow:hidden; box-shadow:0 2px 8px rgba(0,0,0,0.08);">
+                <div style="font-size:16px; color:#5f4638;">
+                    {summary['month_year_text']} &nbsp;|&nbsp; Generated on {summary['report_date']}
+                </div>
+            </div>
 
-    <tr>
-        <td style="padding:0;">
+            <div style="padding:36px 40px 40px 40px; background:#fafafa;">
+                <p style="font-size:16px; margin:0 0 22px 0;">Dear {salutation},</p>
 
-            <!--[if mso]>
-            <v:rect xmlns:v="urn:schemas-microsoft-com:vml" fill="true" stroke="false" style="width:800px;">
-            <v:fill type="gradient" color="#FFF6EE" color2="#E8620E" angle="45" />
-            <v:textbox inset="0,0,0,0">
-            <![endif]-->
+                <p style="font-size:16px; line-height:1.7; margin:0 0 18px 0;">
+                    Please find below the consolidated employee office availability report for Canada IT team for
+                    <span style="color:#f26a21; font-weight:bold;"> {summary['month_year_text']}</span>.
+                    This report presents employee office availability against the monthly benchmark, providing
+                    insights into overall alignment with the organization's office presence expectations.
+                </p>
 
-            <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0"
-                style="background-color:#F2854A; background-image: linear-gradient(120deg, #FFF6EE 0%, #FCD3AC 40%, #E8620E 100%);">
-                <tr>
-                    <td class="header-pad" style="padding:34px 40px 30px 40px;">
+                <p style="font-size:16px; line-height:1.7; margin:0 0 30px 0;">
+                    Kindly review the summary below. For employee-level details, please click on
+                    <b>View Full Report</b>.
+                </p>
 
-                        <p style="margin:0 0 12px 0; font-size:12px; font-weight:700; letter-spacing:1.6px; color:#B34A17; font-family:Arial,sans-serif;">
-                            PwC &nbsp;|&nbsp; Canada IT
-                        </p>
+                <div style="display:flex; gap:12px; margin-bottom:14px; flex-wrap:wrap;">
+                    <div style="flex:1; min-width:180px; background:#fff3ea; border:1px solid #f4c9a8; border-radius:8px; text-align:center; padding:18px 10px;">
+                        <div style="font-size:22px; font-weight:bold; color:#c65b22;">{summary['total_emp']}</div>
+                        <div style="font-size:14px; color:#c97b46;">Total Employees</div>
+                    </div>
 
-                        <h1 class="header-text" style="margin:0 0 8px 0; color:#241f1a; font-size:25px; font-weight:700; line-height:1.3; font-family:Arial,sans-serif;">
-                            Monthly Employee Office Availability Report
-                        </h1>
+                    <div style="flex:1; min-width:180px; background:#e9f7ee; border:1px solid #c6e7d1; border-radius:8px; text-align:center; padding:18px 10px;">
+                        <div style="font-size:22px; font-weight:bold; color:#1f8b57;">{summary['avg_attendance']}</div>
+                        <div style="font-size:14px; color:#339567;">Avg. Days/Employee</div>
+                    </div>
 
-                        <div style="width:64px; height:3px; background-color:#241f1a; margin:0 0 14px 0; font-size:0; line-height:0;">&nbsp;</div>
+                    <div style="flex:1; min-width:180px; background:#fff7ea; border:1px solid #f3ddb4; border-radius:8px; text-align:center; padding:18px 10px;">
+                        <div style="font-size:22px; font-weight:bold; color:#bd7a1d;">{summary['working_days']}</div>
+                        <div style="font-size:14px; color:#c58a34;">Working Days</div>
+                    </div>
+                </div>
 
-                        <p style="margin:0; color:#5a4230; font-size:14px; font-family:Arial,sans-serif;">
-                            {summary['month']} / {summary['year']} &nbsp;|&nbsp; Generated on {summary['report_date']}
-                        </p>
+                <div style="display:flex; gap:12px; margin-bottom:30px; flex-wrap:wrap;">
+                    <div style="flex:1; min-width:180px; background:#fde9de; border-radius:10px; text-align:center; padding:24px 10px;">
+                        <div style="font-size:22px; font-weight:bold; color:#d45f2e;">{summary['below_10']}</div>
+                        <div style="font-size:14px; color:#d45f2e;">Towards Achievement (&lt; 10 days)</div>
+                    </div>
 
-                    </td>
-                </tr>
-            </table>
+                    <div style="flex:1; min-width:180px; background:#dff3e6; border-radius:10px; text-align:center; padding:24px 10px;">
+                        <div style="font-size:22px; font-weight:bold; color:#25a05a;">{summary['equal_10']}</div>
+                        <div style="font-size:14px; color:#25a05a;">Achieved (= 10 days)</div>
+                    </div>
 
-            <!--[if mso]>
-            </v:textbox>
-            </v:rect>
-            <![endif]-->
+                    <div style="flex:1; min-width:180px; background:#20834d; border-radius:10px; text-align:center; padding:24px 10px;">
+                        <div style="font-size:22px; font-weight:bold; color:#ffffff;">{summary['above_10']}</div>
+                        <div style="font-size:14px; color:#ffffff;">Above Achievement (&gt; 10 days)</div>
+                    </div>
+                </div>
 
-        </td>
-    </tr>
+                {button_html}
+            </div>
+        </div>
+    </body>
+    </html>
+    """
 
-    <tr>
-        <td style="padding:28px 40px 20px 40px;" class="mobile-padding">
-            <p style="margin:0 0 15px 0; color:#1a1a1a; font-size:15px; line-height:1.6; font-family:Arial,sans-serif;">
-                Dear Shreyasi di,
-            </p>
-            <p class="intro-text" style="margin:0 0 15px 0; color:#4a4a4a; font-size:15px; line-height:1.6; font-family:Arial,sans-serif;">
-                Please find below the consolidated employee office availability report for Canada IT team for <strong style="color:#E8620E;">{summary['month']} / {summary['year']}</strong>. This report presents employee office availability against the monthly benchmark, providing insights into overall alignment with the organization's office presence expectations.
-            </p>
-            <p class="intro-text" style="margin:0 0 20px 0; color:#4a4a4a; font-size:15px; line-height:1.6; font-family:Arial,sans-serif;">
-                Kindly review the data below. For discrepancies, please reach out to Abhinandan Roy.
-            </p>
 
-            <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0">
-                <tr>
-                    <td width="33%" style="padding:4px;">
-                        <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="background-color:#FFF3EA; border-radius:6px; border:1px solid #FFE0C7;">
-                            <tr><td style="padding:15px; text-align:center;">
-                                <p style="margin:0; font-size:22px; font-weight:700; color:#C0562A; font-family:Arial,sans-serif;">{summary['total_emp']}</p>
-                                <p style="margin:0; font-size:12px; color:#9a6642; font-family:Arial,sans-serif;">Total Employees</p>
-                            </td></tr>
-                        </table>
-                    </td>
-                    <td width="33%" style="padding:4px;">
-                        <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="background-color:#EEFBF3; border-radius:6px; border:1px solid #D2F0DE;">
-                            <tr><td style="padding:15px; text-align:center;">
-                                <p style="margin:0; font-size:22px; font-weight:700; color:#1A7A4A; font-family:Arial,sans-serif;">{summary['avg_attendance']}</p>
-                                <p style="margin:0; font-size:12px; color:#4a9a6a; font-family:Arial,sans-serif;">Avg. Days/Employee</p>
-                            </td></tr>
-                        </table>
-                    </td>
-                    <td width="33%" style="padding:4px;">
-                        <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="background-color:#FFF8EC; border-radius:6px; border:1px solid #FFE9C4;">
-                            <tr><td style="padding:15px; text-align:center;">
-                                <p style="margin:0; font-size:22px; font-weight:700; color:#B06A1A; font-family:Arial,sans-serif;">{summary['working_days']}</p>
-                                <p style="margin:0; font-size:12px; color:#c08a4a; font-family:Arial,sans-serif;">Working Days</p>
-                            </td></tr>
-                        </table>
-                    </td>
-                </tr>
-            </table>
-        </td>
-    </tr>
+def build_full_employee_report_html(tracker_file):
+    summary, error = read_tracker_summary(tracker_file)
+    if error:
+        return f"<html><body><p>{error}</p></body></html>"
 
-    <tr>
-        <td style="padding:10px 40px 30px 40px;" class="mobile-padding">
-            <table role="presentation" class="responsive-table" width="100%" cellpadding="0" cellspacing="0" border="0" style="border-collapse:collapse; border:1px solid #e5e5e5; border-radius:6px; overflow:hidden;">
+    sorted_rows = sorted(summary["rows"], key=lambda x: (-x["total"], x["name"].lower()))
 
-                <thead>
-                    <tr>
-                        <th align="left" style="background-color:#E8620E; color:#ffffff; padding:12px 15px; font-size:13px; font-family:Arial,sans-serif; font-weight:600;">Employee Name</th>
-                        <th align="left" style="background-color:#E8620E; color:#ffffff; padding:12px 15px; font-size:13px; font-family:Arial,sans-serif; font-weight:600;">Employee ID</th>
-                        <th align="center" style="background-color:#E8620E; color:#ffffff; padding:12px 15px; font-size:13px; font-family:Arial,sans-serif; font-weight:600;">Total Days in Office</th>
+    rows_html = ""
+    for idx, item in enumerate(sorted_rows, start=1):
+        rows_html += f"""
+        <tr>
+            <td style="padding:10px; border:1px solid #ddd;">{idx}</td>
+            <td style="padding:10px; border:1px solid #ddd;">{item['name']}</td>
+            <td style="padding:10px; border:1px solid #ddd;">{item['id']}</td>
+            <td style="padding:10px; border:1px solid #ddd;">{item['email']}</td>
+            <td style="padding:10px; border:1px solid #ddd; text-align:center;">{item['total']}</td>
+        </tr>
+        """
+
+    return f"""
+    <html>
+    <body style="margin:0; padding:30px; background:#f7f7f7; font-family:Arial, sans-serif; color:#333;">
+        <div style="max-width:1100px; margin:0 auto; background:#fff; box-shadow:0 2px 10px rgba(0,0,0,0.08);">
+            <div style="background:#f58645; padding:30px 35px;">
+                <div style="font-size:14px; color:#7a4a2b; letter-spacing:2px; font-weight:bold;">
+                    PwC | Canada IT
+                </div>
+                <h1 style="margin:16px 0 6px 0; color:#222;">Full Employee Office Availability Report</h1>
+                <div style="font-size:16px; color:#5f4638;">
+                    {summary['month_year_text']} | Generated on {summary['report_date']}
+                </div>
+            </div>
+
+            <div style="padding:30px 35px;">
+                <p style="font-size:16px; margin-bottom:20px;">
+                    Detailed employee office availability report.
+                </p>
+
+                <table style="width:100%; border-collapse:collapse; background:#fff;">
+                    <tr style="background:#f58645; color:#fff;">
+                        <th style="padding:12px; border:1px solid #ddd;">#</th>
+                        <th style="padding:12px; border:1px solid #ddd;">Employee Name</th>
+                        <th style="padding:12px; border:1px solid #ddd;">Employee ID</th>
+                        <th style="padding:12px; border:1px solid #ddd;">Employee Email</th>
+                        <th style="padding:12px; border:1px solid #ddd;">Total Days in Office</th>
                     </tr>
-                </thead>
-
-                <tbody>
-{table_rows}
-                </tbody>
-
-            </table>
-
-            <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="margin-top:15px;">
-                <tr><td style="font-size:11px; color:#8a8a8a; font-family:Arial,sans-serif; line-height:1.8;">
-                    <span style="background-color:#FFE8D9; color:#C0562A; padding:2px 8px; border-radius:10px; font-weight:600;">●</span> Towards Achievement (&lt; 10 days)
-                    &nbsp;&nbsp;
-                    <span style="background-color:#E3F7EA; color:#2E9E5B; padding:2px 8px; border-radius:10px; font-weight:600;">●</span> Achieved (= 10 days)
-                    &nbsp;&nbsp;
-                    <span style="background-color:#1A7A4A; color:#FFFFFF; padding:2px 8px; border-radius:10px; font-weight:600;">●</span> Above Achievement (&gt; 10 days)
-                </td></tr>
-            </table>
-        </td>
-    </tr>
-
-    <tr>
-        <td style="background-color:#fafafa; padding:24px 40px; border-top:1px solid #e5e5e5;" class="mobile-padding">
-            <p style="margin:0; font-size:12px; color:#a0a0a0; font-family:Arial,sans-serif;">
-                © 2026 PwC. All rights reserved.
-            </p>
-        </td>
-    </tr>
-
-</table>
-</td></tr>
-</table>
-
-</body>
-</html>"""
-    return html
+                    {rows_html}
+                </table>
+            </div>
+        </div>
+    </body>
+    </html>
+    """
 
 
-def send_month_end_report(tracker_file):
-    html_body = build_month_end_report_html(tracker_file)
-    recipients = [ABHINANDAN_EMAIL, DEBORSHI_EMAIL]
-    send_html_email_multi(
-        recipients,
+def export_month_end_report_html(tracker_file):
+    html_body = build_full_employee_report_html(tracker_file)
+
+    dated_export_path = os.path.join(REPORT_EXPORT_DIR, f"month_end_full_report_{today_str()}.html")
+    latest_export_path = os.path.join(REPORT_EXPORT_DIR, "month_end_full_report_latest.html")
+
+    with open(dated_export_path, "w", encoding="utf-8") as f:
+        f.write(html_body)
+
+    with open(latest_export_path, "w", encoding="utf-8") as f:
+        f.write(html_body)
+
+    print(f"Full month-end report exported to archive file: {dated_export_path}")
+    print(f"Full month-end report updated at fixed file: {latest_export_path}")
+    return latest_export_path
+
+
+def send_month_end_report_to_abhinandan_and_deborshi(tracker_file):
+    export_month_end_report_html(tracker_file)
+
+    recipients = [
+        ("Abhinandan Roy", ABHINANDAN_EMAIL),
+        ("Deborshi Som", DEBORSHI_EMAIL),
+    ]
+
+    for display_name, email in recipients:
+        html_body = build_month_end_report_html(
+            tracker_file,
+            ONEDRIVE_FULL_REPORT_URL,
+            salutation=display_name
+        )
+
+        plain_text = "Monthly employee office availability report."
+        if ONEDRIVE_FULL_REPORT_URL:
+            plain_text += f" View full report: {ONEDRIVE_FULL_REPORT_URL}"
+
+        ok = send_html_email(
+            email,
+            "Monthly Employee Office Availability Report",
+            html_body,
+            plain_text=plain_text,
+            display_name=display_name
+        )
+
+        if ok:
+            print(f"Month-end report sent successfully to {email}")
+        else:
+            print(f"Month-end report failed for {email}")
+
+        time.sleep(5)
+
+
+def send_month_end_report_to_shreyasi(tracker_file):
+    export_month_end_report_html(tracker_file)
+
+    html_body = build_month_end_report_html(
+        tracker_file,
+        ONEDRIVE_FULL_REPORT_URL,
+        salutation="Shreyasi Ma'am"
+    )
+
+    plain_text = "Monthly employee office availability report."
+    if ONEDRIVE_FULL_REPORT_URL:
+        plain_text += f" View full report: {ONEDRIVE_FULL_REPORT_URL}"
+
+    ok = send_html_email(
+        SHREYASI_EMAIL,
         "Monthly Employee Office Availability Report",
         html_body,
-        plain_text="Monthly employee office availability report."
+        plain_text=plain_text,
+        display_name="Shreyasi Dutta"
     )
+
+    if ok:
+        print(f"Month-end report sent successfully to {SHREYASI_EMAIL}")
+    else:
+        print(f"Month-end report failed for {SHREYASI_EMAIL}")
 
 
 def prompt_manual_awareness_trigger(test_tracker_file):
-    try:
-        choice = input("Do you want to manually trigger awareness mails to employees from Test_Tracker.xlsx? (yes/no): ").strip().lower()
-        if choice == "yes":
-            send_awareness_mails_from_test_tracker(test_tracker_file)
-    except Exception as e:
-        print(f"Manual awareness trigger failed: {e}")
+    choice = input("Do you want to manually trigger awareness mails to employees from Test_Tracker.xlsx? (yes/no): ").strip().lower()
+    if choice == "yes":
+        send_awareness_mails_from_test_tracker(test_tracker_file)
 
 
 def prompt_resend_failed_awareness_trigger():
-    try:
-        choice = input("Do you want to retry failed awareness mails from failed_awareness_mails.csv? (yes/no): ").strip().lower()
-        if choice == "yes":
-            resend_failed_awareness_mails()
-    except Exception as e:
-        print(f"Retry failed awareness trigger failed: {e}")
+    choice = input("Do you want to retry failed awareness mails from failed_awareness_mails.csv? (yes/no): ").strip().lower()
+    if choice == "yes":
+        resend_failed_awareness_mails()
+
+
+def prompt_export_month_end_report_trigger(tracker_file):
+    choice = input("Do you want to export full employee month-end report as HTML? (yes/no): ").strip().lower()
+    if choice == "yes":
+        export_month_end_report_html(tracker_file)
 
 
 def prompt_manual_month_end_report_trigger(tracker_file):
-    try:
-        choice = input("Do you want to manually trigger month-end overall report to Abhinandan and Deborshi? (yes/no): ").strip().lower()
-        if choice == "yes":
-            send_month_end_report(tracker_file)
-    except Exception as e:
-        print(f"Manual month-end report trigger failed: {e}")
+    choice = input("Do you want to manually trigger month-end overall report to Abhinandan and Deborshi? (yes/no): ").strip().lower()
+    if choice == "yes":
+        send_month_end_report_to_abhinandan_and_deborshi(tracker_file)
+
+    choice2 = input("Do you want to manually trigger the same month-end report to Shreyasi ma'am as well? (yes/no): ").strip().lower()
+    if choice2 == "yes":
+        send_month_end_report_to_shreyasi(tracker_file)
 
 
-def save_step(page, name):
+# =========================
+# INPUT / MERGE FUNCTIONS
+# =========================
+def read_employee_input():
+    df = pd.read_excel(INPUT_FILE).fillna("")
+    rename_map = {}
+
+    for col in df.columns:
+        low = str(col).strip().lower()
+        if low in ["id", "employee id", "employee_id"]:
+            rename_map[col] = "employee_id"
+        elif low in ["name", "employee name", "employee_name"]:
+            rename_map[col] = "employee_name"
+        elif low in ["email", "employee email", "employee_email", "mail"]:
+            rename_map[col] = "employee_email"
+
+    df = df.rename(columns=rename_map)
+
+    if "employee_id" not in df.columns:
+        df["employee_id"] = ""
+    if "employee_name" not in df.columns:
+        df["employee_name"] = ""
+    if "employee_email" not in df.columns:
+        df["employee_email"] = ""
+
+    return df[["employee_id", "employee_name", "employee_email"]]
+
+
+def read_monthly_employees_from_test_tracker():
+    wb, ws, header_map = get_month_sheet_or_none(TEST_TRACKER_FILE)
+    if wb is None:
+        return pd.DataFrame(columns=["employee_id", "employee_name", "employee_email"])
+
+    rows = []
+    for row_idx in range(2, ws.max_row + 1):
+        emp_id = normalize_str(ws.cell(row=row_idx, column=header_map["id"]).value) if "id" in header_map else ""
+        emp_name = normalize_str(ws.cell(row=row_idx, column=header_map["name"]).value) if "name" in header_map else ""
+        emp_email = normalize_str(ws.cell(row=row_idx, column=header_map["email"]).value) if "email" in header_map else ""
+
+        if emp_id or emp_name or emp_email:
+            rows.append({
+                "employee_id": emp_id,
+                "employee_name": emp_name,
+                "employee_email": emp_email
+            })
+
+    wb.close()
+    return pd.DataFrame(rows)
+
+
+def merge_unique_employees(df1, df2):
+    combined = pd.concat(
+        [df1[["employee_id", "employee_name", "employee_email"]],
+         df2[["employee_id", "employee_name", "employee_email"]]],
+        ignore_index=True
+    )
+
+    combined["employee_id"] = combined["employee_id"].astype(str).str.strip()
+    combined["employee_name"] = combined["employee_name"].astype(str).str.strip()
+    combined["employee_email"] = combined["employee_email"].astype(str).str.strip()
+
+    combined = combined[
+        (combined["employee_id"] != "") |
+        (combined["employee_name"] != "") |
+        (combined["employee_email"] != "")
+    ].copy()
+
+    combined["merge_key"] = combined.apply(
+        lambda r: f"id::{r['employee_id']}" if r["employee_id"]
+        else (f"email::{r['employee_email'].lower()}" if r["employee_email"]
+        else f"name::{r['employee_name'].lower()}"),
+        axis=1
+    )
+
+    combined = combined.drop_duplicates(subset=["merge_key"], keep="first").drop(columns=["merge_key"])
+    return combined.reset_index(drop=True)
+
+
+# =========================
+# BROWSER REUSE FIX
+# =========================
+def is_cdp_running(port=CDP_PORT):
     try:
-        page.screenshot(path=os.path.join(SCREENSHOT_DIR, f"{ts()}_{name}.png"), full_page=True, timeout=8000)
+        r = requests.get(f"http://127.0.0.1:{port}/json/version", timeout=2)
+        return r.status_code == 200
     except Exception:
-        pass
-    try:
-        with open(os.path.join(HTML_DIR, f"{ts()}_{name}.html"), "w", encoding="utf-8") as f:
-            f.write(page.content())
-    except Exception:
-        pass
-    try:
-        txt = page.locator("body").inner_text(timeout=5000)
-        with open(os.path.join(TEXT_DIR, f"{ts()}_{name}.txt"), "w", encoding="utf-8") as f:
-            f.write(txt)
-    except Exception:
-        pass
+        return False
 
 
-def wait_for_cdp(port=9222, retries=30, delay=1):
-    url = f"http://127.0.0.1:{port}/json/version"
+def wait_for_cdp(port=CDP_PORT, retries=30, delay=1):
     for _ in range(retries):
-        try:
-            r = requests.get(url, timeout=2)
-            if r.status_code == 200:
-                return True
-        except Exception:
-            pass
+        if is_cdp_running(port):
+            return True
         time.sleep(delay)
     return False
 
 
-def get_any_live_page(browser, retries=30, delay=2):
-    for _ in range(retries):
-        pages = []
-        for context in browser.contexts:
-            for page in context.pages:
-                try:
-                    if not page.is_closed():
-                        pages.append(page)
-                except Exception:
-                    pass
+def launch_edge_if_needed():
+    if is_cdp_running(CDP_PORT):
+        print("Reusing existing Edge debug session.")
+        return
 
-        for page in pages:
+    print("Launching Edge debug session...")
+    subprocess.Popen(
+        [
+            EDGE_EXE,
+            f"--remote-debugging-port={CDP_PORT}",
+            f"--user-data-dir={EDGE_PROFILE_DIR}",
+        ],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL
+    )
+
+    if not wait_for_cdp(CDP_PORT, retries=30, delay=1):
+        raise RuntimeError("CDP did not start.")
+
+
+def get_any_live_page(browser):
+    for context in browser.contexts:
+        for page in context.pages:
             try:
-                if "moveinsync.com" in page.url:
+                if not page.is_closed():
                     return page
             except Exception:
                 pass
 
-        if pages:
-            return pages[-1]
-
-        time.sleep(delay)
-
-    raise RuntimeError("Could not find any live browser page")
+    context = browser.new_context()
+    return context.new_page()
 
 
-def close_extra_pages(browser, keep_page):
+def get_or_open_wis_page(browser):
+    for context in browser.contexts:
+        for page in context.pages:
+            try:
+                if not page.is_closed() and "moveinsync.com" in page.url:
+                    print("Reusing existing MoveInSync tab.")
+                    return page
+            except Exception:
+                pass
+
+    page = get_any_live_page(browser)
     try:
-        for context in browser.contexts:
-            for pg in context.pages[:]:
-                try:
-                    if pg != keep_page and not pg.is_closed():
-                        pg.close()
-                except Exception:
-                    pass
+        page.goto(WIS_URL, wait_until="domcontentloaded")
     except Exception:
         pass
+    return page
 
 
+# =========================
+# PLAYWRIGHT HELPERS
+# =========================
 def text_visible(page, text_value, timeout=5000):
     try:
         page.get_by_text(text_value, exact=False).wait_for(timeout=timeout)
@@ -1207,12 +1090,9 @@ def get_wis_frame(page):
 
 def open_team_calendar(page):
     frame = get_wis_frame(page)
-    save_step(page, "04_before_team_calendar_click")
-
     try:
         frame.get_by_role("button", name="View Team Calendar").click(timeout=10000, force=True)
         time.sleep(5)
-        save_step(page, "05_after_team_calendar_click")
         return True
     except Exception:
         pass
@@ -1220,7 +1100,6 @@ def open_team_calendar(page):
     try:
         frame.locator(VIEW_TEAM_CALENDAR_XPATH).first.click(timeout=10000, force=True)
         time.sleep(5)
-        save_step(page, "05_after_team_calendar_xpath_click")
         return True
     except Exception:
         pass
@@ -1238,16 +1117,13 @@ def get_search_box(page):
 
 def clear_and_type(search_box, value):
     search_box.click(timeout=5000)
-    time.sleep(0.2)
     try:
         search_box.fill("")
         search_box.fill(str(value))
-        return
     except Exception:
-        pass
-    search_box.press("Control+A")
-    search_box.press("Backspace")
-    search_box.type(str(value), delay=100)
+        search_box.press("Control+A")
+        search_box.press("Backspace")
+        search_box.type(str(value), delay=100)
 
 
 def click_clear_all(page):
@@ -1258,6 +1134,7 @@ def click_clear_all(page):
         return True
     except Exception:
         pass
+
     try:
         frame.locator(CLEAR_ALL_XPATH).click(timeout=5000, force=True)
         time.sleep(1.5)
@@ -1266,12 +1143,20 @@ def click_clear_all(page):
         return False
 
 
-def select_employee_from_result(page, emp_id, emp_name):
+def select_employee_from_result(page, emp_id, emp_name, emp_email=""):
     frame = get_wis_frame(page)
 
     if emp_id:
         try:
             frame.get_by_text(f"ID: {emp_id}", exact=False).first.click(timeout=5000, force=True)
+            time.sleep(2)
+            return True
+        except Exception:
+            pass
+
+    if emp_email:
+        try:
+            frame.get_by_text(emp_email, exact=False).first.click(timeout=5000, force=True)
             time.sleep(2)
             return True
         except Exception:
@@ -1285,13 +1170,6 @@ def select_employee_from_result(page, emp_id, emp_name):
         except Exception:
             pass
 
-    try:
-        frame.get_by_text("ID:", exact=False).first.click(timeout=5000, force=True)
-        time.sleep(2)
-        return True
-    except Exception:
-        pass
-
     return False
 
 
@@ -1300,9 +1178,8 @@ def close_status_popup_if_any(page):
     try:
         frame.locator("#close-btn").click(timeout=3000, force=True)
         time.sleep(1)
-        return True
     except Exception:
-        return False
+        pass
 
 
 def get_container_text(locator, timeout=4000):
@@ -1315,7 +1192,6 @@ def get_container_text(locator, timeout=4000):
 
 def parse_status_text(status_text):
     normalized = " ".join(status_text.upper().split())
-
     if "CHECKED OUT" in normalized:
         return {"checked_in": "Yes", "checked_out": "Yes"}
     if "CHECKED IN" in normalized:
@@ -1327,89 +1203,61 @@ def parse_status_text(status_text):
 
 def extract_status_for_abhinandan(page):
     frame = get_wis_frame(page)
-    locator = frame.locator(ABHINANDAN_STATUS_XPATH)
-    status_text = get_container_text(locator)
-    return parse_status_text(status_text)
+    text_val = get_container_text(frame.locator(ABHINANDAN_STATUS_XPATH))
+    return parse_status_text(text_val)
 
 
 def extract_status_for_other_employee(page):
     frame = get_wis_frame(page)
-    locator = frame.locator(OTHERS_STATUS_XPATH)
-    status_text = get_container_text(locator)
-    return parse_status_text(status_text)
+    text_val = get_container_text(frame.locator(OTHERS_STATUS_XPATH))
+    return parse_status_text(text_val)
 
 
 def get_attendance_value(checked_in, checked_out):
     return "Yes" if checked_in == "Yes" or checked_out == "Yes" else "No"
 
 
+# =========================
+# MAIN
+# =========================
 def main():
-    temp_profile = os.path.join(os.getcwd(), "edge_debug_profile")
-    os.makedirs(temp_profile, exist_ok=True)
-
-    subprocess.Popen(
-        [
-            EDGE_EXE,
-            f"--remote-debugging-port={CDP_PORT}",
-            f"--user-data-dir={temp_profile}",
-            WIS_URL,
-        ]
-    )
-
-    if not wait_for_cdp(CDP_PORT, retries=30, delay=1):
-        print("CDP did not start")
-        return
+    launch_edge_if_needed()
 
     input_employees = read_employee_input()
-
-    try:
-        test_tracker_employees = read_monthly_employees_from_test_tracker()
-    except Exception as e:
-        print(f"Error reading Test_Tracker.xlsx: {e}")
-        return
-
+    test_tracker_employees = read_monthly_employees_from_test_tracker()
     employees = merge_unique_employees(input_employees, test_tracker_employees)
+
+    print(f"Total unique employees to process: {len(employees)}")
     results = []
 
     with sync_playwright() as p:
-        browser = None
+        browser = p.chromium.connect_over_cdp(f"http://127.0.0.1:{CDP_PORT}")
+        page = get_or_open_wis_page(browser)
+        page.set_default_timeout(TIMEOUT_MS)
+
         try:
-            browser = p.chromium.connect_over_cdp(f"http://127.0.0.1:{CDP_PORT}")
-            page = get_any_live_page(browser)
-            close_extra_pages(browser, page)
-            page.set_default_timeout(TIMEOUT_MS)
-
-            try:
-                page.goto(WIS_URL, wait_until="domcontentloaded")
-            except Exception:
-                pass
-
-            time.sleep(8)
-            page = get_any_live_page(browser)
-            save_step(page, "01_initial_page")
+            time.sleep(5)
 
             if text_visible(page, "Pick an account", 5000):
                 try:
                     page.locator('[data-test-id="abhinandan.roy@pwc.com"]').click(timeout=10000, force=True)
                     time.sleep(8)
-                    page = get_any_live_page(browser)
                 except Exception:
-                    click_text(page, "abhinandan.roy@pwc.com", "02_pick_account_fallback")
-                    time.sleep(8)
-                    page = get_any_live_page(browser)
-
-            save_step(page, "03_after_login")
+                    try:
+                        click_text(page, "abhinandan.roy@pwc.com", "pick_account")
+                    except Exception:
+                        pass
 
             opened = open_team_calendar(page)
             if not opened:
-                print("Auto-click for Team Calendar failed.")
-                input("Open Team Calendar manually, then press Enter here... ")
+                input("Open Team Calendar manually, then press Enter... ")
 
             for _, row in employees.iterrows():
-                emp_id = str(row.get("employee_id", "")).strip()
-                emp_name = str(row.get("employee_name", "")).strip()
+                emp_id = normalize_str(row.get("employee_id", ""))
+                emp_name = normalize_str(row.get("employee_name", ""))
+                emp_email = normalize_str(row.get("employee_email", ""))
 
-                if not emp_id and not emp_name:
+                if not emp_id and not emp_name and not emp_email:
                     continue
 
                 try:
@@ -1418,22 +1266,22 @@ def main():
                     else:
                         click_clear_all(page)
                         search_box = get_search_box(page)
-                        search_value = emp_id if emp_id else emp_name
+                        search_value = emp_id if emp_id else (emp_email if emp_email else emp_name)
                         clear_and_type(search_box, search_value)
                         time.sleep(SEARCH_WAIT_SEC)
 
-                        selected = select_employee_from_result(page, emp_id, emp_name)
+                        selected = select_employee_from_result(page, emp_id, emp_name, emp_email)
                         if not selected:
-                            results.append(
-                                {
-                                    "date": today_str(),
-                                    "employee_id": emp_id,
-                                    "employee_name": emp_name,
-                                    "attendance": "No",
-                                    "checked_in": "No",
-                                    "checked_out": "No",
-                                }
-                            )
+                            results.append({
+                                "date": today_str(),
+                                "employee_id": emp_id,
+                                "employee_name": emp_name,
+                                "employee_email": emp_email,
+                                "attendance": "No",
+                                "checked_in": "No",
+                                "checked_out": "No",
+                            })
+                            print(f"Not found: {emp_name} | {emp_id} | {emp_email}")
                             continue
 
                         status = extract_status_for_other_employee(page)
@@ -1441,51 +1289,46 @@ def main():
 
                     attendance = get_attendance_value(status["checked_in"], status["checked_out"])
 
-                    results.append(
-                        {
-                            "date": today_str(),
-                            "employee_id": emp_id,
-                            "employee_name": emp_name,
-                            "attendance": attendance,
-                            "checked_in": status["checked_in"],
-                            "checked_out": status["checked_out"],
-                        }
-                    )
+                    results.append({
+                        "date": today_str(),
+                        "employee_id": emp_id,
+                        "employee_name": emp_name,
+                        "employee_email": emp_email,
+                        "attendance": attendance,
+                        "checked_in": status["checked_in"],
+                        "checked_out": status["checked_out"],
+                    })
+
+                    print(f"Processed: {emp_name} | {emp_id} | {emp_email} | {attendance}")
 
                 except Exception as e:
-                    print(f"Error for {emp_name} | {emp_id}: {e}")
-                    results.append(
-                        {
-                            "date": today_str(),
-                            "employee_id": emp_id,
-                            "employee_name": emp_name,
-                            "attendance": "Error",
-                            "checked_in": "Error",
-                            "checked_out": "Error",
-                        }
-                    )
+                    print(f"Error for {emp_name} | {emp_id} | {emp_email}: {e}")
+                    results.append({
+                        "date": today_str(),
+                        "employee_id": emp_id,
+                        "employee_name": emp_name,
+                        "employee_email": emp_email,
+                        "attendance": "Error",
+                        "checked_in": "Error",
+                        "checked_out": "Error",
+                    })
 
             sheet_name = write_results_to_excel(results, OUTPUT_FILE)
-
             update_tracker_excel(results, TRACKER_FILE)
             update_tracker_excel(results, TEST_TRACKER_FILE)
 
-            print(f"Updated {TRACKER_FILE} for today: {today_str()}")
-            print(f"Updated {TEST_TRACKER_FILE} for today: {today_str()}")
+            print(f"Done. Output saved to {OUTPUT_FILE}, sheet: {sheet_name}")
+            print(f"Updated {TRACKER_FILE}")
+            print(f"Updated {TEST_TRACKER_FILE}")
 
             prompt_manual_awareness_trigger(TEST_TRACKER_FILE)
             prompt_resend_failed_awareness_trigger()
+            prompt_export_month_end_report_trigger(TRACKER_FILE)
             prompt_manual_month_end_report_trigger(TRACKER_FILE)
 
-            print(f"Done. Output saved to {OUTPUT_FILE}, sheet: {sheet_name}")
-
         finally:
-            try:
-                if browser:
-                    browser.close()
-            except Exception:
-                pass
+            browser.close()
 
 
 if __name__ == "__main__":
-    main() 
+    main()
